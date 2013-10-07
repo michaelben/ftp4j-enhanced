@@ -3497,6 +3497,164 @@ public class FTPClient {
 	}
 
 	/**
+	 * This method returns an InputStream for a download operation from the remote server.
+	 * 
+	 * Calling this method blocks the current thread until the operation is
+	 * completed. The operation could be interrupted by another thread calling
+	 * abortCurrentDataTransfer(). The method will break with a
+	 * FTPAbortedException.
+	 * 
+	 * @param fileName
+	 *            The name of the remote file.
+	 * @param restartAt
+	 *            The restart point (number of bytes already downloaded). Use
+	 *            {@link FTPClient#isResumeSupported()} to check if the server
+	 *            supports resuming of broken data transfers.
+	 * @return InputStream
+	 * @throws IllegalStateException
+	 *             If the client is not connected or not authenticated.
+	 * @throws IOException
+	 *             If an I/O error occurs.
+	 * @throws FTPIllegalReplyException
+	 *             If the server replies in an illegal way.
+	 * @throws FTPException
+	 *             If the operation fails.
+	 * @throws FTPDataTransferException
+	 *             If a I/O occurs in the data transfer connection. If you
+	 *             receive this exception the transfer failed, but the main
+	 *             connection with the remote FTP server is in theory still
+	 *             working.
+	 * @throws FTPAbortedException
+	 *             If operation is aborted by another thread.
+	 * @see FTPClient#abortCurrentDataTransfer(boolean)
+	 */
+	public InputStream download(String fileName, long restartAt)
+			throws IllegalStateException, IOException,
+			FTPIllegalReplyException, FTPException, FTPDataTransferException,
+			FTPAbortedException {
+		synchronized (lock) {
+			// Is this client connected?
+			if (!connected) {
+				throw new IllegalStateException("Client not connected");
+			}
+			// Is this client authenticated?
+			if (!authenticated) {
+				throw new IllegalStateException("Client not authenticated");
+			}
+			// Select the type of contents.
+			int tp = type;
+			if (tp == TYPE_AUTO) {
+				tp = detectType(fileName);
+			}
+			if (tp == TYPE_TEXTUAL) {
+				communication.sendFTPCommand("TYPE A");
+			} else if (tp == TYPE_BINARY) {
+				communication.sendFTPCommand("TYPE I");
+			}
+			FTPReply r = communication.readFTPReply();
+			touchAutoNoopTimer();
+			if (!r.isSuccessCode()) {
+				throw new FTPException(r);
+			}
+			// Prepares the connection for the data transfer.
+			FTPDataTransferConnectionProvider provider = openDataTransferChannel();
+			// REST command (if supported and/or requested).
+			if (restSupported || restartAt > 0) {
+				boolean done = false;
+				try {
+					communication.sendFTPCommand("REST " + restartAt);
+					r = communication.readFTPReply();
+					touchAutoNoopTimer();
+					if (r.getCode() != 350 && ((r.getCode() != 501 && r.getCode() != 502) || restartAt > 0)) {
+						throw new FTPException(r);
+					}
+					done = true;
+				} finally {
+					if (!done) {
+						provider.dispose();
+					}
+				}
+			}
+			// Local abort state.
+			boolean wasAborted = false;
+			// Send the RETR command.
+			communication.sendFTPCommand("RETR " + fileName);
+			try {
+				Socket dtConnection;
+				try {
+					dtConnection = provider.openDataTransferConnection();
+				} finally {
+					provider.dispose();
+				}
+				// Change the operation status.
+				synchronized (abortLock) {
+					ongoingDataTransfer = true;
+					aborted = false;
+					consumeAborCommandReply = false;
+				}
+				// Download the stream.
+				try {
+					// Opens the data transfer connection.
+					dataTransferInputStream = dtConnection.getInputStream();
+					// MODE Z enabled?
+					if (modezEnabled) {
+						dataTransferInputStream = new InflaterInputStream(dataTransferInputStream);
+					}
+					
+					return dataTransferInputStream;
+				} catch (IOException e) {
+					synchronized (abortLock) {
+						if (aborted) {
+							throw new FTPAbortedException();
+						} else {
+							throw new FTPDataTransferException(
+									"I/O error in data transfer", e);
+						}
+					}
+				} finally {
+					// Closing stream and data connection.
+					if (dataTransferInputStream != null) {
+						try {
+							dataTransferInputStream.close();
+						} catch (Throwable t) {
+							;
+						}
+					}
+					try {
+						dtConnection.close();
+					} catch (Throwable t) {
+						;
+					}
+					// Set to null the instance-level input stream.
+					dataTransferInputStream = null;
+					// Change the operation status.
+					synchronized (abortLock) {
+						wasAborted = aborted;
+						ongoingDataTransfer = false;
+						aborted = false;
+					}
+				}
+			} finally {
+				r = communication.readFTPReply();
+				touchAutoNoopTimer();
+				if (r.getCode() != 150 && r.getCode() != 125) {
+					throw new FTPException(r);
+				}
+				// Consumes the result reply of the transfer.
+				r = communication.readFTPReply();
+				if (!wasAborted && r.getCode() != 226) {
+					throw new FTPException(r);
+				}
+				// ABOR command response (if needed).
+				if (consumeAborCommandReply) {
+					communication.readFTPReply();
+					consumeAborCommandReply = false;
+				}
+			}
+		}
+	}
+	
+	/**
 	 * This method detects the type for a file transfer.
 	 */
 	private int detectType(String fileName) throws IOException,
